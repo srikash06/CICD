@@ -1,9 +1,9 @@
-FROM python:3.12-slim AS dependencies
+FROM python:3.14-slim AS dependencies
 WORKDIR /build
 COPY requirements.txt .
 RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 ARG VERSION=local
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 APP_VERSION=${VERSION} DATABASE_PATH=/data/orders.db
 WORKDIR /app

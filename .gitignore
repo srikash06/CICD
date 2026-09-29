@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+*.log
+data/
+.coverage
+coverage.xml
+junit.xml
+.pytest_cache/
+.ruff_cache/

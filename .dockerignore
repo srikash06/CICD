@@ -1,0 +1,6 @@
+**
+!app.py
+!Dockerfile
+!requirements.txt
+!migrations/
+!migrations/**

@@ -1,0 +1,123 @@
+name: CI-CD practice
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize complete main-branch runs, including deployment.
+concurrency:
+  group: practice-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install locked dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check app.py tests scripts/smoke.py
+      - name: Unit, API, concurrency and persistence tests; coverage gate
+        run: pytest --cov=app --cov-branch --cov-fail-under=85 --cov-report=term-missing --cov-report=xml --junitxml=junit.xml
+      - name: Preserve test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-evidence
+          path: |
+            junit.xml
+            coverage.xml
+          retention-days: 14
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Calculate image name
+        shell: bash
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - name: Build once
+        run: docker build --pull --build-arg VERSION="$GITHUB_SHA" -t "$IMAGE" .
+      - name: Smoke test built image
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker logs smoke || true; docker rm -f smoke || true' EXIT
+          docker run -d --name smoke -e API_KEY=ci-only-not-a-real-secret-32-characters -p 127.0.0.1:8080:8080 "$IMAGE"
+          for attempt in $(seq 1 30); do
+            if python3 scripts/smoke.py http://127.0.0.1:8080 "$GITHUB_SHA"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Block high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+      - name: Push the tested image and capture digest
+        id: publish
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG
+          DOCKER_CONFIG=$(mktemp -d)
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Release: $digest" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: image
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: [self-hosted, Linux, X64, cicd-lab]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Pull and deploy immutable image; roll back on failure
+        env:
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG
+          DOCKER_CONFIG=$(mktemp -d)
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          bash scripts/deploy.sh "$IMAGE_DIGEST" "$GITHUB_SHA"
